@@ -105,46 +105,78 @@ forecast_stochvol <- function(data, h) {
 ##==== Learn priors..
 ##==============================##
 
+## Substitute MoM with MLE at some point.
+
 learn_priors <- function(proxy_returns) {
   
   # 1. Fit the Standard Model to the Proxy
-  # We use default uninformative priors here to let the long history speak.
   message("Fitting model to proxy data to learn priors...")
+  # We use default uninformative priors here to let the long history speak.
   fit_proxy <- svsample(proxy_returns, designmatrix = "ar0", quiet = FALSE)
   
-  # 2. Autolearn MU (Mean Return)
-  # We simply take the mean and sd of the posterior draws.
-  mu_draws <- para(fit_proxy, "mu")
-  learned_mu <- c(mean(mu_draws), sd(mu_draws))
+  # =========================================================
+  # FIX: Convert mcmc.list objects to standard matrices first
+  # =========================================================
+  sv_params   <- as.matrix(fit_proxy$para) # Contains: mu, phi, sigma
+  beta_params <- as.matrix(fit_proxy$beta) # Contains: beta_0 (Intercept/Drift)
   
-  # 3. Autolearn SIGMA (Volatility of Volatility)
-  # SV assumes sigma^2 ~ Gamma. The 'priorsigma' argument corresponds 
-  # roughly to the expected variance. We use the posterior mean of sigma^2.
-  sigma_draws <- para(fit_proxy, "sigma")
+  # ---------------------------------------------------------
+  # 2. Autolearn MU (Volatility Level)
+  # NOTE: In stochvol, 'mu' is the mean of log-volatility, NOT price drift.
+  # ---------------------------------------------------------
+  mu_draws <- sv_params[, "mu"]
+  
+  # Robustness: Inflate SD to avoid being too dogmatic
+  learned_mu <- c(mean(mu_draws), sd(mu_draws) * 2)
+  
+  # ---------------------------------------------------------
+  # 3. Autolearn BETA (Price Drift / Mean Return)
+  # This is the parameter that controls the long-term trend.
+  # ---------------------------------------------------------
+  # We extract the first column (the intercept)
+  drift_draws <- beta_params[, 1] 
+  
+  # We define a Normal prior for the drift: c(mean, sd)
+  learned_beta <- c(mean(drift_draws), sd(drift_draws) * 2)
+  
+  # ---------------------------------------------------------
+  # 4. Autolearn SIGMA (Volatility of Volatility)
+  # ---------------------------------------------------------
+  sigma_draws <- sv_params[, "sigma"]
   learned_sigma <- mean(sigma_draws^2)
   
-  # 4. Autolearn PHI (Persistence)
-  # SV uses a Beta(a, b) prior on transformed phi: (phi+1)/2.
-  # We use 'Method of Moments' to match the proxy's alpha/beta shape.
-  phi_draws <- para(fit_proxy, "phi")
+  # ---------------------------------------------------------
+  # 5. Autolearn PHI (Persistence)
+  # ---------------------------------------------------------
+  phi_draws <- sv_params[, "phi"]
   
-  # Transform phi (-1 to 1) to x (0 to 1)
+  # Transform phi (-1 to 1) to x (0 to 1) for Beta distribution
   x <- (phi_draws + 1) / 2
+  
+  # Method of Moments
   mean_x <- mean(x)
   var_x  <- var(x)
   
-  # Calculate Beta parameters (a, b) from mean and variance
+  # Handle numeric instability (if variance is extremely small)
+  if (is.na(var_x) || var_x < 1e-8) var_x <- 1e-8
+  
   term <- (mean_x * (1 - mean_x) / var_x) - 1
   a_learned <- mean_x * term
   b_learned <- (1 - mean_x) * term
   
-  learned_phi <- c(a_learned, b_learned)
+  # Safety check for invalid Beta parameters
+  if (is.na(a_learned) || a_learned <= 0 || b_learned <= 0) {
+    warning("Method of moments failed for Phi. Reverting to default priors.")
+    learned_phi <- c(5, 1.5)
+  } else {
+    learned_phi <- c(a_learned, b_learned)
+  }
   
-  # Return the list of learned priors
   list(
-    mu = learned_mu,
-    phi = learned_phi,
-    sigma = learned_sigma
+    mu    = learned_mu,    # Prior for Volatility Level
+    beta  = learned_beta,  # Prior for Drift (Mean Return)
+    phi   = learned_phi,   # Prior for Persistence
+    sigma = learned_sigma  # Prior for Vol of Vol
   )
 }
 
@@ -203,12 +235,18 @@ forecast_stochvol_price <- function(data, h,
   # ---------------------------------------------------------
   # 6. OUTPUT
   # ---------------------------------------------------------
-  tibble(
+  Price_forecast <- tibble(
     day_ahead = 1:h,
     price_lower  = price_paths[idx_lower, ],  
     price_medium = price_paths[idx_median, ], 
     price_upper  = price_paths[idx_upper, ]   
   )
+  
+  Out <- list(SVSample_fit = fit,
+              Price_forecast = Price_forecast,
+              target = targets)
+  
+  return(Out)
 }
 
 #==============================================================================#
@@ -261,8 +299,10 @@ test_tbl <- data.frame(Date = index(combined_data), coredata(combined_data)) %>%
 #==== 03B - Forecasted Stock Price ============================================#
 
 data <- test_tbl
-price_forecast <- forecast_stochvol_price(data = data,
+price_forecast_all <- forecast_stochvol_price(data = data,
                                           h = 100)
+
+price_forecast <- price_forecast_all[["Price_forecast"]]
 
 ## Chart.
 ggplot(price_forecast, aes(x = day_ahead)) +
@@ -276,17 +316,20 @@ ggplot(price_forecast, aes(x = day_ahead)) +
 
 proxy_data <- DownloadYahooFinance("SPY", start_date = "2000-01-01")
 proxy_ret  <- Return.calculate(proxy_data, method="log") %>% na.omit() %>% as.vector()
+proxy_ret_cutoff  <- proxy_ret[5800:length(proxy_ret)]
 
 # 2. Learn the Priors
 # This extracts the 'risk characteristics' of the asset class.
 my_priors <- learn_priors(proxy_ret)
+my_priors_cutoff <- learn_priors(proxy_ret_cutoff)
 
 print("Learned Priors:")
 print(my_priors)
+print(my_priors_cutoff)
 
 # 3. Apply to Your Limited Portfolio Data
 # Your portfolio might be short, but the priors now enforce realistic risk behavior.
-forecast_result <- forecast_stochvol_price_t(
+forecast_result_all <- forecast_stochvol_price(
   data = test_tbl, 
   h = 100,
   prior_nu = 0.1,                # Enable heavy tails
@@ -294,6 +337,36 @@ forecast_result <- forecast_stochvol_price_t(
   prior_phi = my_priors$phi,     # Learned persistence (clustering)
   prior_sigma = my_priors$sigma  # Learned vol-of-vol
 )
+forecast_result <- forecast_result_all[["Price_forecast"]]
+
+forecast_result_cutoff_all <- forecast_stochvol_price(
+  data = test_tbl, 
+  h = 100,
+  prior_nu = 0.1,                # Enable heavy tails
+  prior_mu = my_priors_cutoff$mu,       # Learned drift
+  prior_phi = my_priors_cutoff$phi,     # Learned persistence (clustering)
+  prior_sigma = my_priors_cutoff$sigma  # Learned vol-of-vol
+)
+forecast_result_cutoff <- forecast_result_cutoff_all[["Price_forecast"]]
+
+tail(forecast_result)
+tail(forecast_result_cutoff)
+
+## Chart.
+ggplot(forecast_result, aes(x = day_ahead)) +
+  geom_line(aes(y = price_medium), color = "blue", size = 1) +
+  geom_ribbon(aes(ymin = price_lower, ymax = price_upper), fill = "blue", alpha = 0.2) +
+  labs(title = "100-Day MSFT Price Forecast (Volatility Cone)",
+       y = "Stock Price", x = "Days Ahead") +
+  theme_minimal()
+
+ggplot(forecast_result_cutoff, aes(x = day_ahead)) +
+  geom_line(aes(y = price_medium), color = "blue", size = 1) +
+  geom_ribbon(aes(ymin = price_lower, ymax = price_upper), fill = "blue", alpha = 0.2) +
+  labs(title = "100-Day MSFT Price Forecast (Volatility Cone)",
+       y = "Stock Price", x = "Days Ahead") +
+  theme_minimal()
+
 
 #==============================================================================#
 #==== 04 - Mistr===============================================================#
